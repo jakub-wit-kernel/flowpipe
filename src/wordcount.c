@@ -3,6 +3,8 @@
 #include "flowpipe/wordcount.h"
 
 #include <errno.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,8 @@ enum split_rule { SPLIT_WORD, SPLIT_LINE };
 struct split_reader {
 	int fd;
 	enum split_rule rule;
+	volatile int *cancel;	/* from the pipeline config, may be NULL */
+	int may_block;		/* -1 unknown, 0 regular file, 1 pipe/tty/socket */
 	unsigned char *carry;	/* tail of the previous read, not yet emitted */
 	size_t carry_len;
 	size_t carry_cap;
@@ -27,6 +31,35 @@ struct split_reader {
 static bool is_boundary(const struct split_reader *sr, unsigned char ch)
 {
 	return sr->rule == SPLIT_LINE ? ch == '\n' : !fp_is_word_byte(ch);
+}
+
+/*
+ * read() that notices cancellation while waiting on a pipe, FIFO or
+ * terminal, where a read can block indefinitely. Regular files never
+ * block for long, so they skip the poll.
+ */
+static ssize_t cancellable_read(struct split_reader *sr, void *buf, size_t n)
+{
+	if (sr->may_block < 0) {
+		struct stat st;
+
+		sr->may_block = fstat(sr->fd, &st) == 0 && !S_ISREG(st.st_mode);
+	}
+	while (sr->may_block && sr->cancel) {
+		struct pollfd p = { .fd = sr->fd, .events = POLLIN };
+
+		if (__atomic_load_n(sr->cancel, __ATOMIC_RELAXED))
+			return -ECANCELED;
+		int r = poll(&p, 1, 100);
+
+		if (r > 0)
+			break;
+		if (r < 0 && errno != EINTR)
+			return -errno;
+	}
+	ssize_t got = read(sr->fd, buf, n);
+
+	return got < 0 ? -errno : got;
 }
 
 /*
@@ -40,15 +73,16 @@ static ssize_t split_read(void *ctx, fp_chunk *c)
 	struct split_reader *sr = ctx;
 	size_t len = sr->carry_len, cut;
 
-	memcpy(c->in, sr->carry, len);
+	if (len)
+		memcpy(c->in, sr->carry, len);
 	sr->carry_len = 0;
 	while (!sr->eof && len < c->in_cap) {
-		ssize_t n = read(sr->fd, c->in + len, c->in_cap - len);
+		ssize_t n = cancellable_read(sr, c->in + len, c->in_cap - len);
 
 		if (n < 0) {
-			if (errno == EINTR)
+			if (n == -EINTR)
 				continue;
-			return -errno;
+			return n;
 		}
 		if (n == 0)
 			sr->eof = true;
@@ -59,8 +93,8 @@ static ssize_t split_read(void *ctx, fp_chunk *c)
 
 	for (cut = len; cut > 0 && !is_boundary(sr, c->in[cut - 1]); cut--)
 		;
-	if (cut == 0)
-		return (ssize_t)len;	/* no boundary: emit as is */
+	if (cut == 0 || cut == len)
+		return (ssize_t)len;	/* no boundary, or nothing to carry */
 	if (len - cut > sr->carry_cap) {
 		unsigned char *p = realloc(sr->carry, len - cut);
 
@@ -106,7 +140,7 @@ static int table_init(struct table *t, size_t cap)
 	memset(t, 0, sizeof(*t));
 	t->e = calloc(cap, sizeof(*t->e));
 	t->cap = cap;
-	fp_arena_init(&t->keys, 256 * 1024);
+	fp_arena_init(&t->keys, (size_t)256 * 1024);
 	return t->e ? 0 : -ENOMEM;
 }
 
@@ -304,7 +338,8 @@ int fp_wordcount(int fd, const struct fp_pipeline_config *cfg_in,
 {
 	struct fp_pipeline_config cfg;
 	struct fp_pipeline_ops ops = { .read = split_read, .work = wc_work };
-	struct wc_ctx wc = { .sr = { .fd = fd, .rule = SPLIT_WORD } };
+	struct wc_ctx wc = { .sr = { .fd = fd, .rule = SPLIT_WORD,
+				     .may_block = -1 } };
 	struct wc_priv *priv = NULL;
 	fp_pool *pool = NULL;
 	int ret, nparts;
@@ -314,6 +349,7 @@ int fp_wordcount(int fd, const struct fp_pipeline_config *cfg_in,
 	if (cfg_in)
 		cfg = *cfg_in;
 	cfg.ordered = false;	/* counting is order-independent */
+	wc.sr.cancel = cfg.cancel;
 
 	wc.tables = calloc((size_t)cfg.workers, sizeof(*wc.tables));
 	if (!wc.tables)
@@ -452,7 +488,8 @@ int fp_upper(int in_fd, int out_fd, const struct fp_pipeline_config *cfg_in,
 {
 	struct fp_pipeline_config cfg;
 	struct fp_pipeline_ops ops = { split_read, up_work, up_write };
-	struct up_ctx u = { .sr = { .fd = in_fd, .rule = SPLIT_LINE },
+	struct up_ctx u = { .sr = { .fd = in_fd, .rule = SPLIT_LINE,
+				    .may_block = -1 },
 			    .out_fd = out_fd };
 	int ret;
 
@@ -460,6 +497,7 @@ int fp_upper(int in_fd, int out_fd, const struct fp_pipeline_config *cfg_in,
 	if (cfg_in)
 		cfg = *cfg_in;
 	cfg.ordered = true;
+	u.sr.cancel = cfg.cancel;
 	ret = fp_pipeline_run(&cfg, &ops, &u, stats);
 	free(u.sr.carry);
 	return ret;

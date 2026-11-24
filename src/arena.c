@@ -15,7 +15,7 @@ struct fp_arena_block {
 void fp_arena_init(fp_arena *a, size_t block_size)
 {
 	memset(a, 0, sizeof(*a));
-	a->block_size = block_size ? block_size : 64 * 1024;
+	a->block_size = block_size ? block_size : (size_t)64 * 1024;
 }
 
 void *fp_arena_alloc(fp_arena *a, size_t size, size_t align)

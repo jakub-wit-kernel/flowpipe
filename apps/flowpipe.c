@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,10 +28,19 @@
 
 static volatile int g_cancel;
 
-static void on_sigint(int sig)
+/*
+ * SIGINT/SIGTERM are blocked in every thread and received synchronously
+ * here. That avoids depending on which thread the kernel picks to run an
+ * asynchronous handler (or on when a sanitizer runtime chooses to run it).
+ */
+static void *signal_thread(void *arg)
 {
-	(void)sig;
-	__atomic_store_n(&g_cancel, 1, __ATOMIC_RELAXED);
+	sigset_t *set = arg;
+	int sig;
+
+	if (sigwait(set, &sig) == 0)
+		__atomic_store_n(&g_cancel, 1, __ATOMIC_RELAXED);
+	return NULL;
 }
 
 static long parse_long(const char *opt, const char *s, long min, long max)
@@ -128,8 +138,13 @@ static int cmd_sum(int jobs, int argc, char **argv)
 	if (jobs)
 		pc.threads = jobs;
 	js = calloc((size_t)argc, sizeof(*js));
-	if (!js || (r = fp_pool_create(&pool, &pc))) {
-		fprintf(stderr, "flowpipe sum: cannot start pool\n");
+	if (!js)
+		return 1;
+	r = fp_pool_create(&pool, &pc);
+	if (r) {
+		fprintf(stderr, "flowpipe sum: cannot start pool: %s\n",
+			strerror(-r));
+		free(js);
 		return 1;
 	}
 	for (int i = 0; i < argc; i++) {
@@ -196,9 +211,9 @@ int main(int argc, char **argv)
 		case 'i': cfg.max_inflight = (int)parse_long("--inflight", optarg, 1, 1 << 16); break;
 		case 't': top = parse_long("--top", optarg, 0, 1 << 20); break;
 		case 'q':
-			if (!strcmp(optarg, "mutex"))
+			if (strcmp(optarg, "mutex") == 0)
 				cfg.queue_kind = FP_QUEUE_MUTEX;
-			else if (strcmp(optarg, "lockfree"))
+			else if (strcmp(optarg, "lockfree") != 0)
 				usage();
 			break;
 		case 'o': out_path = optarg; break;
@@ -212,13 +227,13 @@ int main(int argc, char **argv)
 			cfg.max_inflight = 4 * jobs;
 		cfg.workers = jobs;
 	}
-	if (!strcmp(cmd, "sum"))
+	if (strcmp(cmd, "sum") == 0)
 		return cmd_sum(jobs, argc - optind, argv + optind);
-	if (strcmp(cmd, "wc") && strcmp(cmd, "upper"))
+	if (strcmp(cmd, "wc") != 0 && strcmp(cmd, "upper") != 0)
 		usage();
 	if (argc - optind > 1)
 		usage();
-	if (optind < argc && strcmp(argv[optind], "-")) {
+	if (optind < argc && strcmp(argv[optind], "-") != 0) {
 		in_fd = open(argv[optind], O_RDONLY | O_CLOEXEC);
 		if (in_fd < 0) {
 			fprintf(stderr, "flowpipe: %s: %s\n", argv[optind],
@@ -227,14 +242,19 @@ int main(int argc, char **argv)
 		}
 	}
 
-	struct sigaction sa = { .sa_handler = on_sigint };
+	static sigset_t sigs;
+	pthread_t sigthr;
 
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
+	sigemptyset(&sigs);
+	sigaddset(&sigs, SIGINT);
+	sigaddset(&sigs, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &sigs, NULL);	/* inherited by all threads */
+	if (pthread_create(&sigthr, NULL, signal_thread, &sigs) == 0)
+		pthread_detach(sigthr);
 	cfg.cancel = &g_cancel;
 	t0 = now_s();
 
-	if (!strcmp(cmd, "wc")) {
+	if (strcmp(cmd, "wc") == 0) {
 		struct fp_wordcount_result res;
 
 		ret = fp_wordcount(in_fd, &cfg, (size_t)top, &res, &st);

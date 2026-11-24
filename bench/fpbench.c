@@ -59,11 +59,12 @@ static void *qprod(void *arg)
 static void *qcons(void *arg)
 {
 	struct qarg *a = arg;
-	uint64_t v, sink = 0;
+	uint64_t v;
+	volatile uint64_t sink = 0;
 
 	while (fp_queue_pop(a->q, &v) == 0)
-		sink += v;
-	return (void *)(uintptr_t)sink;
+		sink = sink + v;
+	return NULL;
 }
 
 static double bench_queue(enum fp_queue_kind kind, int p, int c, long total)
@@ -88,7 +89,9 @@ static double bench_queue(enum fp_queue_kind kind, int p, int c, long total)
 	double secs = now_s() - t0;
 
 	fp_queue_destroy(q);
-	return (double)(total / p * p) / secs;
+	long done = (total / p) * p;	/* integer split across producers */
+
+	return (double)done / secs;
 }
 
 static void run_queue(void)
@@ -166,7 +169,7 @@ static int make_corpus_fd(size_t bytes)
 			const char *w = words[(x >> 8) % 20];
 			size_t n = strlen(w);
 
-			memcpy(buf + len, w, n);
+			memcpy(buf + len, w, n); /* NOLINT(bugprone-not-null-terminated-result): word stream, not a C string */
 			len += n;
 			buf[len++] = (x >> 4) % 13 ? ' ' : '\n';
 		}

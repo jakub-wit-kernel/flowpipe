@@ -102,18 +102,25 @@ static struct ref_entry *reference_count(const char *d, size_t len,
 		(*total)++;
 		size_t k;
 
-		for (k = 0; k < ne && strcmp(e[k].w, w); k++)
+		for (k = 0; k < ne && strcmp(e[k].w, w) != 0; k++)
 			;
 		if (k < ne) {
 			e[k].n++;
 			free(w);
 			continue;
 		}
-		if (ne == cap)
-			e = realloc(e, (cap = cap ? cap * 2 : 64) * sizeof(*e));
+		if (ne == cap) {
+			cap = cap ? cap * 2 : 64;
+			struct ref_entry *ne_ = realloc(e, cap * sizeof(*e));
+
+			if (!ne_)
+				abort();	/* test reference: no recovery */
+			e = ne_;
+		}
 		e[ne++] = (struct ref_entry){ w, 1 };
 	}
-	qsort(e, ne, sizeof(*e), ref_cmp);
+	if (ne)
+		qsort(e, ne, sizeof(*e), ref_cmp);
 	*distinct = ne;
 	return e;
 }
@@ -153,7 +160,7 @@ KT_TEST(wordcount_matches_reference)
 			KT_EQ(res.distinct_words, distinct);
 			KT_EQ(res.top_n, distinct < 50 ? distinct : 50);
 			for (size_t i = 0; i < res.top_n; i++) {
-				if (strcmp(res.top[i].word, ref[i].w) ||
+				if (strcmp(res.top[i].word, ref[i].w) != 0 ||
 				    res.top[i].count != ref[i].n)
 					KT_FAIL("rank %zu: got %s=%llu want %s=%llu "
 						"(workers %d, chunk %zu)", i,

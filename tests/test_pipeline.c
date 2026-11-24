@@ -222,7 +222,7 @@ static ssize_t failing_read(void *ctx, fp_chunk *c)
 {
 	struct src *s = ctx;
 
-	if (s->off >= 20 * 1024)
+	if (s->off >= (size_t)20 * 1024)
 		return -EBADF;
 	return src_read(ctx, c);
 }
@@ -259,7 +259,7 @@ static void *cancel_later(void *arg)
 
 KT_TEST(cancel_from_another_thread)
 {
-	const size_t n = 64u << 20;
+	const size_t n = (size_t)64 << 20;
 	unsigned char *data = make_data(n);
 	struct src s = { .data = data, .len = n, .read_size = 4096,
 			 .max_sleep_us = 500 };

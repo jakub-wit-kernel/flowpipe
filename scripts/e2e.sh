@@ -63,17 +63,25 @@ if "$FP" sum "$tmp/missing" 2>/dev/null; then
 fi
 echo "sum: matches zlib"
 
-# 4. Ctrl-C cancels cleanly with exit status 130.
+# 4. Ctrl-C cancels promptly even while input is idle: the writer stays
+#    open (no EOF), so only the cancel path can end the run.
 mkfifo "$tmp/fifo"
 "$FP" upper -j 2 "$tmp/fifo" -o /dev/null &
 pid=$!
-exec 3>"$tmp/fifo"		# keep the writer open so the read blocks
+exec 3>"$tmp/fifo"		# open blocks until flowpipe opens the FIFO
 printf 'some data\n' >&3
-sleep 0.3
+sleep 0.5			# let it reach the blocking read
 kill -INT "$pid"
-exec 3>&-			# reader wakes from read() and sees the flag
 status=0
+for _ in $(seq 100); do		# must exit within 10 s, writer still open
+	kill -0 "$pid" 2>/dev/null || break
+	sleep 0.1
+done
+if kill -0 "$pid" 2>/dev/null; then
+	echo "flowpipe did not exit after SIGINT with input idle"; kill -9 "$pid"; exit 1
+fi
 wait "$pid" || status=$?
+exec 3>&-
 [[ $status -eq 130 ]] || { echo "expected exit 130 after SIGINT, got $status"; exit 1; }
-echo "SIGINT: cancelled cleanly (130)"
+echo "SIGINT with idle input: cancelled cleanly (130)"
 echo "e2e: all checks passed"

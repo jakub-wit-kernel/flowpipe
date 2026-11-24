@@ -181,18 +181,21 @@ int fp_pipeline_run(const struct fp_pipeline_config *cfg_in,
 	r.ctx = ctx;
 	atomic_init(&r.workers_left, cfg.workers);
 
-	/* Queues hold chunk pointers; capacity m means pushes never block. */
+	/*
+	 * Queues hold chunk pointers (sizeof(fp_chunk *) below is intended);
+	 * capacity m means pushes never block.
+	 */
 	r.chunks = calloc((size_t)m, sizeof(*r.chunks));
-	slots = calloc((size_t)m, sizeof(*slots));
+	slots = calloc((size_t)m, sizeof(*slots)); /* NOLINT(bugprone-sizeof-expression): array of pointers */
 	wt = calloc((size_t)cfg.workers, sizeof(*wt));
 	wa = calloc((size_t)cfg.workers, sizeof(*wa));
 	if (!r.chunks || !slots || !wt || !wa ||
 	    fp_queue_create(&r.free_q, cfg.queue_kind, (size_t)m < 2 ? 2 : (size_t)m,
-			    sizeof(fp_chunk *)) ||
+			    sizeof(fp_chunk *)) || /* NOLINT(bugprone-sizeof-expression) */
 	    fp_queue_create(&r.work_q, cfg.queue_kind, (size_t)m < 2 ? 2 : (size_t)m,
-			    sizeof(fp_chunk *)) ||
+			    sizeof(fp_chunk *)) || /* NOLINT(bugprone-sizeof-expression) */
 	    fp_queue_create(&r.done_q, cfg.queue_kind, (size_t)m < 2 ? 2 : (size_t)m,
-			    sizeof(fp_chunk *))) {
+			    sizeof(fp_chunk *))) { /* NOLINT(bugprone-sizeof-expression) */
 		ret = -ENOMEM;
 		goto out;
 	}
