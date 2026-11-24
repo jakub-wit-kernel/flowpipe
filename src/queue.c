@@ -32,59 +32,92 @@ static inline void cpu_relax(void)
 /* ---- eventcount: "sleep until something changes" on top of a futex ---- */
 
 /*
- * Waiter:   key = ec_prepare(); if (condition) { ec_cancel(); done; }
- *           ec_wait(key);  -- sleeps only if nobody notified since prepare
- * Notifier: make condition true; ec_notify();
+ * Usage.  Waiter:   key = ec_prepare(); if (condition) { ec_cancel(key); done; }
+ *                   ec_wait(key);   -- sleeps unless notified since prepare
+ *         Notifier: make condition true; ec_notify();
  *
- * This is a Dekker-style handshake made with seq_cst fences:
+ * State is one 64-bit word: high 32 bits = epoch, low 32 bits = number of
+ * registered waiters. (Vyukov's eventcount design.)
  *
- *   waiter:   waiters++ ; fence ; key = seq ; re-check condition
- *   notifier: publish   ; fence ; if (waiters) { seq++ ; futex_wake }
+ *  - prepare: atomically register (waiters + 1) and remember the epoch.
+ *  - notify:  if waiters > 0, CAS the word to (epoch + 1, 0): this claims
+ *             every registered waiter at once, then one FUTEX_WAKE wakes
+ *             them. Later notifies see waiters == 0 and make no syscall
+ *             until somebody registers again. (A plain "waiters" counter
+ *             made a producer issue a wake syscall on every push until the
+ *             sleeping consumer got scheduled; measured in fpbench.)
+ *  - cancel:  deregister only if our epoch is still current; if a notifier
+ *             already claimed us, there is nothing to undo.
  *
- * The fences guarantee that either the waiter's re-check sees the published
- * element, or the notifier sees waiters > 0 and bumps seq, in which case
- * futex_wait(seq, key) returns at once or is woken. The fast path (no
- * sleepers) costs the notifier a fence and one load of a mostly-read-shared
- * line; it never writes shared state.
+ * Visibility is a Dekker handshake via seq_cst fences:
+ *   waiter:   register ; fence ; re-check condition
+ *   notifier: publish  ; fence ; read state
+ * Either the waiter's re-check sees the element, or the notifier sees the
+ * registration, bumps the epoch, and futex_wait(epoch, key) cannot sleep.
+ *
+ * The futex word is the epoch half of the 64-bit state.
  */
 struct eventcount {
-	_Atomic uint32_t seq;
-	_Atomic uint32_t waiters;
+	_Atomic uint64_t state;
 };
+
+#define EC_WAITERS(s)	((uint32_t)(s))
+#define EC_EPOCH(s)	((uint32_t)((s) >> 32))
+
+static uint32_t *ec_futex_word(struct eventcount *ec)
+{
+	uint32_t *w = (uint32_t *)&ec->state;
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	return w + 1;
+#else
+	return w;
+#endif
+}
 
 static uint32_t ec_prepare(struct eventcount *ec)
 {
-	atomic_fetch_add(&ec->waiters, 1);
+	uint64_t old = atomic_fetch_add(&ec->state, 1);
+
 	atomic_thread_fence(memory_order_seq_cst);
-	return atomic_load(&ec->seq);
+	return EC_EPOCH(old);
 }
 
-static void ec_cancel(struct eventcount *ec)
+static void ec_cancel(struct eventcount *ec, uint32_t key)
 {
-	atomic_fetch_sub(&ec->waiters, 1);
+	uint64_t s = atomic_load(&ec->state);
+
+	/* Still registered in epoch `key`? Then remove ourselves. */
+	while (EC_EPOCH(s) == key &&
+	       !atomic_compare_exchange_weak(&ec->state, &s, s - 1))
+		;
 }
 
 static void ec_wait(struct eventcount *ec, uint32_t key)
 {
-	/* Returns immediately (EAGAIN) if seq already moved past key. */
-	syscall(SYS_futex, &ec->seq, FUTEX_WAIT_PRIVATE, key, NULL, NULL, 0);
-	atomic_fetch_sub(&ec->waiters, 1);
+	/* Returns immediately (EAGAIN) if the epoch already moved past key. */
+	syscall(SYS_futex, ec_futex_word(ec), FUTEX_WAIT_PRIVATE, key, NULL,
+		NULL, 0);
+	ec_cancel(ec, key);	/* no-op if a notifier claimed us */
 }
 
 static void ec_notify(struct eventcount *ec)
 {
+	uint64_t s;
+
 	atomic_thread_fence(memory_order_seq_cst);
-	if (!atomic_load_explicit(&ec->waiters, memory_order_relaxed))
-		return;
-	atomic_fetch_add(&ec->seq, 1);
-	/*
-	 * Wake every sleeper: waking one is cheaper, but a woken thread may
-	 * lose the race for the element and go back to sleep while another
-	 * sleeper could have made progress. Sleepers are rare under load
-	 * because waiters spin first.
-	 */
-	syscall(SYS_futex, &ec->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL,
-		0);
+	s = atomic_load_explicit(&ec->state, memory_order_relaxed);
+	while (EC_WAITERS(s)) {
+		uint64_t next = (uint64_t)(EC_EPOCH(s) + 1u) << 32;
+
+		if (atomic_compare_exchange_weak(&ec->state, &s, next)) {
+			/* Wake all claimed waiters: any of them may be the one
+			 * able to make progress. */
+			syscall(SYS_futex, ec_futex_word(ec), FUTEX_WAKE_PRIVATE,
+				INT_MAX, NULL, NULL, 0);
+			return;
+		}
+	}
 }
 
 /* ---- common header ----------------------------------------------------- */
@@ -209,11 +242,11 @@ static int lf_push(fp_queue *q, const void *elem, bool block)
 		uint32_t key = ec_prepare(&q->not_full);
 
 		if (atomic_load(&q->closed)) {
-			ec_cancel(&q->not_full);
+			ec_cancel(&q->not_full, key);
 			return -EPIPE;
 		}
 		if (lf_try_push(q, elem) == 0) {
-			ec_cancel(&q->not_full);
+			ec_cancel(&q->not_full, key);
 			ec_notify(&q->not_empty);
 			return 0;
 		}
@@ -235,7 +268,7 @@ static int lf_pop(fp_queue *q, void *out, bool block)
 		uint32_t key = ec_prepare(&q->not_empty);
 
 		if (lf_try_pop(q, out) == 0) {
-			ec_cancel(&q->not_empty);
+			ec_cancel(&q->not_empty, key);
 			ec_notify(&q->not_full);
 			return 0;
 		}
@@ -245,11 +278,11 @@ static int lf_pop(fp_queue *q, void *out, bool block)
 		 * re-check above has already seen them.
 		 */
 		if (atomic_load(&q->closed)) {
-			ec_cancel(&q->not_empty);
+			ec_cancel(&q->not_empty, key);
 			return lf_try_pop(q, out) == 0 ? 0 : -EPIPE;
 		}
 		if (!block) {
-			ec_cancel(&q->not_empty);
+			ec_cancel(&q->not_empty, key);
 			return -EAGAIN;
 		}
 		ec_wait(&q->not_empty, key);
