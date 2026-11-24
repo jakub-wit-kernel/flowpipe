@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: MIT
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.cc }}${{ matrix.san && format(', {0}', matrix.san) || '' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        san: ["", "address,undefined", "thread"]
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04 kernels use 32 bits of mmap ASLR, which some sanitizer
+      # runtimes (TSan in particular) cannot handle.
+      - name: Relax mmap ASLR for sanitizers
+        if: matrix.san != ''
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.san && 'Debug' || 'RelWithDebInfo' }}
+          -DFP_SANITIZE=${{ matrix.san }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+  stress-repeat:
+    name: Repeated stress (plain + single CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build && cmake --build build -j
+      - name: 10 rounds of queue and pool stress, half pinned to one CPU
+        run: |
+          for i in $(seq 5); do
+            ./build/test_queue stress
+            ./build/test_pool
+            taskset -c 0 ./build/test_queue stress
+            taskset -c 0 ./build/test_pool
+          done
+
+  valgrind:
+    name: Tests under valgrind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j
+      - name: memcheck
+        working-directory: build
+        env:
+          FP_STRESS_ITERS: "2000"
+        run: |
+          for t in test_queue test_pool test_pipeline test_wordcount; do
+            valgrind --error-exitcode=1 --leak-check=full \
+              --show-leak-kinds=definite,indirect -q "./$t"
+          done
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-tidy
+      - run: cmake -S . -B build
+      - run: |
+          for f in src/*.c apps/*.c bench/*.c tests/*.c; do
+            clang-tidy -quiet -p build "$f"
+          done
+
+  benchmark:
+    name: Benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+      - run: ./build/fpbench | tee bench.md
+      - run: |
+          { echo "## Benchmarks (GitHub-hosted runner)"; cat bench.md; } >> "$GITHUB_STEP_SUMMARY"

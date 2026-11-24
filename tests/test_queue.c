@@ -21,11 +21,13 @@
 
 static const enum fp_queue_kind kinds[] = { FP_QUEUE_LOCKFREE, FP_QUEUE_MUTEX };
 
+/* FP_STRESS_ITERS overrides the per-producer count (e.g. small for valgrind). */
 static long iters(long dflt)
 {
-	const char *e = getenv("FP_STRESS_SCALE");
+	const char *e = getenv("FP_STRESS_ITERS");
+	long v = e ? strtol(e, NULL, 10) : 0;
 
-	return e ? dflt * strtol(e, NULL, 10) : dflt;
+	return v > 0 ? v : dflt;
 }
 
 KT_TEST(fifo_full_empty_single_thread)
