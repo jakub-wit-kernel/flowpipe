@@ -240,6 +240,28 @@ Word count is CPU-bound and scales with cores. Upper-casing is close to
 memory-bandwidth-bound. Four workers on two CPUs only adds scheduling
 overhead.
 
+### Same benchmark on a GitHub-hosted runner (2 vCPUs, CI run 45359760525)
+
+| queue shape | lock-free Mops/s | mutex Mops/s | ratio |
+|---|---|---|---|
+| 1 × 1 | 57.20 | 4.86 | 11.8x |
+| 2 × 2 | 57.80 | 3.59 | 16.1x |
+| 4 × 4 | 53.25 | 3.79 | 14.1x |
+| 4 × 1 | 17.17 | 2.97 | 5.8x |
+| 1 × 4 | 27.73 | 3.06 | 9.1x |
+
+- **Thread pool** (empty tasks): lock-free won at every worker count
+  (12.5M / 13.1M / 5.1M tasks/s for 1 / 2 / 4 workers, against 4.6M /
+  4.4M / 3.1M for mutex).
+- **Pipeline:** did **not** scale on that runner (word count 205 → 215
+  MiB/s from 1 to 2 workers), unlike the dev box. One possible cause is
+  two vCPUs that are SMT siblings of one physical core, but this has not
+  been verified. It is an open question; checking `lscpu` on the runner
+  would settle it.
+
+Treat all numbers as specific to their machine. The ratios and their
+direction are the meaningful part.
+
 ## 8. Limitations and future work
 
 - **Wake-one eventcount** to remove the herd on idle pools. This needs
